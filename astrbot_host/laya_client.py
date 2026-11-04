@@ -524,27 +524,26 @@ class LayaDecisionClient:
 
     def __init__(self, *, mode: str = "local", endpoint: str = "", api_key: str = "",
                  timeout_seconds: int = 8, local_model_path: str = "",
-                 request_format: str = "native", model: str = DEFAULT_MODEL):
-        if mode not in {"local", "remote"}:
-            raise LayaClientError("laya_mode_invalid", "Laya 接入方式必须是 local 或 remote")
+                 request_format: str = "native", model: str = ""):
+        if mode not in MODE_MODELS:
+            raise LayaClientError("laya_mode_invalid", "Laya 接入方式必须是 local、remote、jev 或 workers_ai")
         if request_format not in {"native", "cloudflare"}:
             raise LayaClientError("laya_request_format_invalid", "Laya 请求格式必须是 native 或 cloudflare")
-        if type(model) is not str or not model.strip() or len(model) > 256:
+        if type(model) is not str or len(model) > 256:
             raise LayaClientError("laya_model_invalid", "Laya 远程模型名无效")
         self.mode = mode
         self.request_format = request_format
-        self.model = model.strip() if mode == "remote" else DEFAULT_MODEL
+        self.model = DEFAULT_MODEL if mode == "local" else model.strip() or MODE_MODELS[mode]
         self.local_model_path = local_model_path
-        self.model = str(model or "").strip() or MODE_MODELS[mode]
         self.endpoint, self.transport = "", None
-        if mode == "remote":
+        if mode == "workers_ai" or mode == "remote" and request_format == "cloudflare":
+            self.endpoint = _workers_ai_endpoint(endpoint)
+            self.transport = _WorkersAITransport(self.model)
+        elif mode == "remote":
             self.endpoint, self.transport = _endpoint(endpoint), _SystemOneTransport(self.model)
         elif mode == "jev":
             self.endpoint = _endpoint(endpoint, CHAT_COMPLETIONS_PATH)
             self.transport = _JevTransport(self.model)
-        elif mode == "workers_ai":
-            self.endpoint = _workers_ai_endpoint(endpoint)
-            self.transport = _WorkersAITransport(self.model)
         self.api_key = api_key
         self.timeout_seconds = timeout_seconds
         self.last_trace = {}
@@ -687,18 +686,12 @@ class LayaDecisionClient:
         }, enabled_fields=enabled_fields)
 
     def _parse_body(self, raw: str) -> dict:
-        document = _parse_document(raw)
-        if self.request_format == "cloudflare":
-            return _cloudflare_result(document)
-        return document
+        if self.mode == "remote" and self.request_format == "cloudflare":
+            return _cloudflare_result(_parse_document(raw))
+        return self.transport.document(raw)
 
     async def _post(self, model_state: str, questions: dict) -> str:
-        if self.request_format == "cloudflare":
-            # Cloudflare Workers AI wraps the model payload under ``input``.
-            payload = {"model": self.model,
-                       "input": {"state": model_state, "questions": questions}}
-        else:
-            payload = {"state": model_state, "questions": questions, "model": self.model}
+        payload = self.transport.payload(model_state, questions)
         body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         headers = {"Content-Type": "application/json", "Accept": "application/json"}
         if self.api_key:

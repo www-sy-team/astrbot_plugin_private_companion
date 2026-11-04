@@ -186,7 +186,7 @@ class LayaDecisionService:
                                    local_model_path=values["local_model_path"],
                                    api_key=values["api_key"], timeout_seconds=values["timeout_seconds"],
                                    request_format=values.get("request_format", "native"),
-                                   model=(values.get("remote_model", "").strip() or "multilingual"))
+                                   model=(values.get("remote_model", "").strip() or MODE_MODELS[values["mode"]]))
 
     async def test(self) -> dict:
         values = self.store.raw()

@@ -96,8 +96,14 @@ def test_cloudflare_request_format_is_validated_and_persisted(tmp_path):
     assert store.raw()["request_format"] == "cloudflare"
 
 
-def test_cloudflare_body_wraps_input_and_unwraps_result(monkeypatch):
+@pytest.mark.parametrize("result_shape", ["object", "json", "response", "output"])
+def test_cloudflare_body_wraps_input_and_unwraps_result(monkeypatch, result_shape):
     captured = {}
+    result = laya_result()
+    if result_shape == "json":
+        result = json.dumps(result)
+    elif result_shape in {"response", "output"}:
+        result = {result_shape: result}
 
     class Response:
         def __init__(self, payload):
@@ -113,8 +119,9 @@ def test_cloudflare_body_wraps_input_and_unwraps_result(monkeypatch):
             return self.payload
 
     def fake_urlopen(request, timeout=0):
+        captured["url"] = request.full_url
         captured["body"] = json.loads(request.data)
-        return Response(json.dumps({"success": True, "result": laya_result()}).encode())
+        return Response(json.dumps({"success": True, "result": result}).encode())
 
     monkeypatch.setattr(laya_module, "urlopen", fake_urlopen)
     client = LayaDecisionClient(mode="remote",
@@ -122,10 +129,98 @@ def test_cloudflare_body_wraps_input_and_unwraps_result(monkeypatch):
         api_key="token", request_format="cloudflare", model="typesafe/jev-1.14.0")
     decision = asyncio.run(client.probe())
 
+    assert captured["url"] == "https://api.cloudflare.com/client/v4/accounts/example/ai/run"
     assert captured["body"]["model"] == "typesafe/jev-1.14.0"
     assert set(captured["body"]) == {"model", "input"}
     assert set(captured["body"]["input"]) == {"state", "questions"}
     assert decision.document()["action"] == "reply"
+
+
+@pytest.mark.parametrize("mode,default_model,endpoint", [
+    ("workers_ai", "@cf/cloudflare/clef", "https://api.cloudflare.com/client/v4/accounts/example/ai/run"),
+    ("jev", "jev-latest", "https://gateway.test/v1/chat/completions"),
+])
+@pytest.mark.parametrize("configured_model", ["", "custom-decision-model"])
+def test_existing_remote_settings_load_and_call_without_migration(
+        tmp_path, monkeypatch, mode, default_model, endpoint, configured_model):
+    store = LayaSettingsStore(tmp_path)
+    store.path.parent.mkdir(parents=True)
+    original = json.dumps({"enabled": True, "mode": mode, "endpoint": endpoint,
+        "api_key": "synthetic-secret", "remote_model": configured_model, "revision": "old-revision"})
+    store.path.write_text(original, encoding="utf-8")
+    status = store.read()
+    expected_model = configured_model or default_model
+    assert status["mode"] == mode
+    assert status["default_model"] == expected_model
+    assert status["revision"] == "old-revision"
+    assert "synthetic-secret" not in str(status)
+    captured = {}
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def read(self, _limit):
+            document = laya_result()
+            envelope = ({"success": True, "result": document} if mode == "workers_ai" else
+                        {"choices": [{"message": {"content": json.dumps(document)}}]})
+            return json.dumps(envelope).encode()
+
+    def open_url(request, timeout):
+        captured.update(url=request.full_url, headers=request.headers, body=json.loads(request.data))
+        return Response()
+
+    monkeypatch.setattr(laya_module, "urlopen", open_url)
+    service = LayaDecisionService(store, client_factory=LayaDecisionClient)
+    assert asyncio.run(service.test())["decision"] == decision_document()
+    assert captured["url"] == endpoint
+    assert captured["headers"]["Authorization"] == "Bearer synthetic-secret"
+    assert captured["body"]["model"] == expected_model
+    body = (captured["body"]["input"] if mode == "workers_ai" else
+            json.loads(captured["body"]["messages"][0]["content"]))
+    assert set(body["questions"]) == set(DECISION_QUESTIONS)
+    assert store.path.read_text(encoding="utf-8") == original
+    store.update(status["revision"], {"timeout_seconds": 30})
+    assert store.raw()["api_key"] == "synthetic-secret"
+    assert store.raw()["remote_model"] == configured_model
+
+
+@pytest.mark.parametrize("mode,endpoint", [
+    ("workers_ai", "https://api.cloudflare.com/client/v4/accounts/example/ai/run"),
+    ("jev", "https://gateway.test/v1/chat/completions"),
+])
+def test_remote_intervention_uses_selected_mode_with_stale_request_format(monkeypatch, mode, endpoint):
+    captured = {}
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def read(self, _limit):
+            document = {"answers": {"intervention_need": {"type": "choice", "choice": "state"}}}
+            envelope = ({"success": True, "result": document} if mode == "workers_ai" else
+                        {"choices": [{"message": {"content": json.dumps(document)}}]})
+            return json.dumps(envelope).encode()
+
+    def open_url(request, timeout):
+        captured.update(url=request.full_url, body=json.loads(request.data))
+        return Response()
+
+    monkeypatch.setattr(laya_module, "urlopen", open_url)
+    client = LayaDecisionClient(mode=mode, endpoint=endpoint, request_format="cloudflare")
+    choice = asyncio.run(client.classify_intervention({"scope_kind": "private",
+        "user_text": "早点休息吧。", "allowed_domains": ["state"]}))
+    assert choice == "state"
+    assert captured["url"] == endpoint
+    body = (captured["body"]["input"] if mode == "workers_ai" else
+            json.loads(captured["body"]["messages"][0]["content"]))
+    assert set(body["questions"]) == {"intervention_need"}
 
 
 def test_followup_confidence_gate_suppresses_only_weak_automatic_continuations(tmp_path):
